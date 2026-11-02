@@ -1,0 +1,230 @@
+diff --git a/src/UnrealInitializer.cpp b/src/UnrealInitializer.cpp
+index 36a72c7..8d83bb0 100644
+--- a/src/UnrealInitializer.cpp
++++ b/src/UnrealInitializer.cpp
+@@ -1,5 +1,7 @@
+ #include <stdexcept>
+ #include <format>
++#include <string>
++#include <unordered_set>
+ 
+ #include <Helpers/Casting.hpp>
+ #include <SigScanner/SinglePassSigScanner.hpp>
+@@ -40,6 +42,7 @@
+ #define NOMINMAX
+ #include <Windows.h>
+ #include <Psapi.h>
++#include <intrin.h>
+ #elifdef __linux__
+ #include <dlfcn.h>
+ #include <elf.h>
+@@ -48,6 +51,86 @@
+ #error "UnrealInitializer is not supported on this platform"
+ #endif
+ 
++#ifdef _WIN32
++namespace
++{
++    // Minimal layouts of the loader structures, used to walk the module list ourselves instead of
++    // relying on K32EnumProcessModules.
++    struct UnicodeStringLayout
++    {
++        USHORT Length;
++        USHORT MaximumLength;
++        PWSTR Buffer;
++    };
++
++    struct LdrTableEntryLayout
++    {
++        LIST_ENTRY InLoadOrderLinks;
++        LIST_ENTRY InMemoryOrderLinks;
++        LIST_ENTRY InInitializationOrderLinks;
++        void* DllBase;
++        void* EntryPoint;
++        ULONG SizeOfImage;
++        ULONG Padding0;
++        UnicodeStringLayout FullDllName;
++        UnicodeStringLayout BaseDllName;
++    };
++
++    struct PebLdrDataLayout
++    {
++        ULONG Length;
++        BOOLEAN Initialized;
++        BYTE Padding0[3];
++        PVOID SsHandle;
++        LIST_ENTRY InLoadOrderModuleList;
++        LIST_ENTRY InMemoryOrderModuleList;
++        LIST_ENTRY InInitializationOrderModuleList;
++    };
++
++    struct PebHeaderLayout
++    {
++        BYTE InheritedAddressSpace;
++        BYTE ReadImageFileExecOptions;
++        BYTE BeingDebugged;
++        BYTE BitField;
++        BYTE Padding0[4];
++        PVOID Mutant;
++        PVOID ImageBaseAddress;
++        PebLdrDataLayout* Ldr;
++    };
++
++    inline auto GetPebLayout() -> PebHeaderLayout*
++    {
++        return reinterpret_cast<PebHeaderLayout*>(__readgsqword(0x60));
++    }
++
++    // Converts an LDR entry base name to an ANSI string. Returns an empty string on failure.
++    inline auto LdrEntryNameToAnsi(const UnicodeStringLayout& Name) -> std::string
++    {
++        if (Name.Buffer == nullptr || Name.Length == 0)
++        {
++            return {};
++        }
++
++        char Buffer[MAX_PATH]{};
++        const int Converted = WideCharToMultiByte(CP_ACP,
++                                                  0,
++                                                  Name.Buffer,
++                                                  static_cast<int>(Name.Length / sizeof(wchar_t)),
++                                                  Buffer,
++                                                  static_cast<int>(sizeof(Buffer) - 1),
++                                                  nullptr,
++                                                  nullptr);
++        if (Converted <= 0)
++        {
++            return {};
++        }
++
++        return std::string{Buffer, static_cast<size_t>(Converted)};
++    }
++} // namespace
++#endif
++
+ #include <Unreal/Hooks/Internal/ProcessEventProfiler.hpp>
+ #include <Unreal/Hooks/Internal/DetourInstance.hpp>
+ #include <Unreal/Hooks/Internal/DetourSubclasses.hpp>
+@@ -158,19 +241,10 @@ namespace RC::Unreal::UnrealInitializer
+     {
+ #ifdef _WIN32
+         // Setup all modules for the aob scanner
+-        MODULEINFO ModuleInfo;
+-        K32GetModuleInformation(GetCurrentProcess(), GetModuleHandle(nullptr), &ModuleInfo, sizeof(MODULEINFO));
++        MODULEINFO ModuleInfo{};
++        K32GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(nullptr), &ModuleInfo, sizeof(MODULEINFO));
+         SigScannerStaticData::m_modules_info[ScanTarget::MainExe] = ModuleInfo;
+ 
+-        HMODULE Modules[1024];
+-        DWORD BytesRequired;
+-
+-        if (K32EnumProcessModules(GetCurrentProcess(), Modules, sizeof(Modules), &BytesRequired) == 0)
+-        {
+-            throw std::runtime_error{fmt::format("Was unable to enumerate game modules. Error: {}",
+-                                                 to_string(SysError(GetLastError())).c_str())};
+-        }
+-
+         // Default all modules to be the same as MainExe
+         // This is because most UE4 games only have the MainExe module
+         for (size_t i = 0; i < static_cast<size_t>(ScanTarget::Max); ++i)
+@@ -178,32 +252,84 @@ namespace RC::Unreal::UnrealInitializer
+             SigScannerStaticData::m_modules_info.array[i] = ModuleInfo;
+         }
+ 
+-        // Check for modules and save the module info if they exist
+-        for (auto i = 0; i < BytesRequired / sizeof(HMODULE); ++i)
++        // Walk the PEB loader list directly instead of calling K32EnumProcessModules.
++        // Third-party loaders (Steam emulators, anti-tamper layers) rebuild this list and can leave the
++        // last node pointing back into the chain instead of at the list head. K32EnumProcessModules then
++        // walks 10000 entries and fails with ERROR_INVALID_HANDLE, and that loop cannot be bounded from
++        // the outside. This walk is read-only: the loader list itself is never modified.
++        PebHeaderLayout* Peb = GetPebLayout();
++        PebLdrDataLayout* Ldr = Peb != nullptr ? Peb->Ldr : nullptr;
++
++        size_t WalkedEntries{};
++        bool CycleDetected{};
++
++        if (Ldr != nullptr)
+         {
+-            char ModuleRawName[MAX_PATH];
+-            // TODO: Fix an occasional error: "Call to K32GetModuleBaseNameA failed. Error Code: 6 (ERROR_INVALID_HANDLE)"
+-            if (K32GetModuleBaseNameA(GetCurrentProcess(), Modules[i], ModuleRawName, sizeof(ModuleRawName) / sizeof(char)) == 0)
+-            {
+-                continue;
+-            }
++            constexpr size_t MaxLdrEntries = 4096;
+ 
+-            std::string ModuleName{ModuleRawName};
++            LIST_ENTRY* Head = &Ldr->InMemoryOrderModuleList;
++            std::unordered_set<LIST_ENTRY*> Visited;
++            Visited.reserve(256);
+ 
+-            for (size_t i2 = 0; i2 < static_cast<size_t>(ScanTarget::Max); ++i2)
++            for (LIST_ENTRY* Link = Head->Flink; Link != nullptr && Link != Head; Link = Link->Flink)
+             {
+-                std::string ModuleToFind{"-"};
+-                ModuleToFind.append(ScanTargetToString(i2));
+-                ModuleToFind.append("-Win64-Shipping.dll");
++                if (Visited.size() >= MaxLdrEntries)
++                {
++                    CycleDetected = true;
++                    break;
++                }
++
++                if (!Visited.insert(Link).second)
++                {
++                    // The chain loops back into itself, stop here instead of spinning forever
++                    CycleDetected = true;
++                    break;
++                }
++
++                auto* Entry = CONTAINING_RECORD(Link, LdrTableEntryLayout, InMemoryOrderLinks);
++                if (Entry->DllBase == nullptr)
++                {
++                    // Forged sentinel entries created by module hiders have no base address
++                    continue;
++                }
++
++                std::string ModuleName = LdrEntryNameToAnsi(Entry->BaseDllName);
++                if (ModuleName.empty())
++                {
++                    continue;
++                }
+ 
+-                size_t Occurrence = ModuleName.find(ModuleToFind);
+-                if (Occurrence != ModuleName.npos)
++                for (size_t i2 = 0; i2 < static_cast<size_t>(ScanTarget::Max); ++i2)
+                 {
++                    std::string ModuleToFind{"-"};
++                    ModuleToFind.append(ScanTargetToString(i2));
++                    ModuleToFind.append("-Win64-Shipping.dll");
++
++                    if (ModuleName.find(ModuleToFind) == std::string::npos)
++                    {
++                        continue;
++                    }
++
+                     if (!SigScannerStaticData::m_is_modular) { SigScannerStaticData::m_is_modular = true; }
+ 
+-                    K32GetModuleInformation(GetCurrentProcess(), Modules[i], &SigScannerStaticData::m_modules_info[static_cast<ScanTarget>(i2)], sizeof(MODULEINFO));
++                    MODULEINFO TargetInfo{};
++                    TargetInfo.lpBaseOfDll = Entry->DllBase;
++                    TargetInfo.SizeOfImage = Entry->SizeOfImage;
++                    TargetInfo.EntryPoint = Entry->EntryPoint;
++                    SigScannerStaticData::m_modules_info.array[i2] = TargetInfo;
+                 }
+             }
++
++            WalkedEntries = Visited.size();
++        }
++
++        if (Ldr == nullptr || WalkedEntries == 0)
++        {
++            Output::send<LogLevel::Warning>(STR("[Unreal] Was unable to walk the PEB module list, only the main executable will be scanned.\n"));
++        }
++        else if (CycleDetected)
++        {
++            Output::send<LogLevel::Warning>(STR("[Unreal] PEB module list is cyclic, walked {} unique entries.\n"), WalkedEntries);
+         }
+ #elifdef __linux__
+         LINUX_MODULEINFO MainModuleInfo{};

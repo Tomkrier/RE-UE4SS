@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Keep patch files byte-exact so `git apply` works
+*.patch text eol=lf
