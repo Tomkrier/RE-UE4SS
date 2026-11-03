@@ -42,6 +42,8 @@ unset(MSVC)
 FetchContent_MakeAvailable(PolyHook2)
 include("${CMAKE_CURRENT_LIST_DIR}/patch_iat.cmake")
 ue4ss_patch_polyhook_iat("${polyhook2_SOURCE_DIR}")
+include("${CMAKE_CURRENT_LIST_DIR}/patch_relocation_range.cmake")
+ue4ss_patch_polyhook_relocation_range("${polyhook2_SOURCE_DIR}")
 
 # Override PolyHook's C++ standard to match ours
 if(TARGET PolyHook_2)
