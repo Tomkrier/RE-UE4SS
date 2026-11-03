@@ -65,11 +65,32 @@
 #include <UnrealDef.hpp>
 
 #include <polyhook2/PE/IatHook.hpp>
+#include <polyhook2/ErrorLog.hpp>
 
 #include <FilesystemWatcher.hpp>
 
 namespace RC
 {
+    // PolyHook2 logs nowhere by default (PLH::Log::m_logger is null), which makes every detour
+    // installation failure look identical: "Failed to add hook, detour installation likely failed!".
+    // Forward PLH's warnings/errors into the UE4SS log so the actual reason is visible
+    // (hooking disabled / function unavailable / function too small / near allocation failed).
+    class PlhLogger final : public PLH::Logger
+    {
+      public:
+        auto log(const std::string& msg, PLH::ErrorLevel level) -> void override
+        {
+            if (level == PLH::ErrorLevel::SEV)
+            {
+                Output::send<LogLevel::Error>(STR("[PLH] {}\n"), ensure_str(msg));
+            }
+            else if (level == PLH::ErrorLevel::WARN)
+            {
+                Output::send<LogLevel::Warning>(STR("[PLH] {}\n"), ensure_str(msg));
+            }
+        }
+    };
+
     // Commented out because this system (turn off hotkeys when in-game console is open) it doesn't work properly.
     /*
     auto get_player_controller() -> UObject*
@@ -385,6 +406,14 @@ namespace RC
     {
         ProfilerSetThreadName("UE4SS-InitThread");
         ProfilerScope();
+
+        // Surface PolyHook2 diagnostics (warnings/errors only) in the UE4SS log.
+        static bool s_plh_logger_registered{};
+        if (!s_plh_logger_registered)
+        {
+            s_plh_logger_registered = true;
+            PLH::Log::registerLogger(std::make_shared<PlhLogger>());
+        }
 
         try
         {
