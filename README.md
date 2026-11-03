@@ -91,7 +91,9 @@ standard flow works unchanged - no fork of UEPseudo is needed and no manual patc
 git clone --recursive https://github.com/Tomkrier/RE-UE4SS.git
 cd RE-UE4SS
 git submodule update --init --recursive      # only needed if you cloned without --recursive
-build_ue4ss.bat                              # or the CMake commands below
+
+cmake -B build_cmake_Game__Shipping__Win64 -G Ninja -DCMAKE_BUILD_TYPE=Game__Shipping__Win64
+cmake --build build_cmake_Game__Shipping__Win64
 ```
 
 The fork's changes to the submodule are kept as patch files in [`patches/`](patches) and replayed
