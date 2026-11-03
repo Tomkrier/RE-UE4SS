@@ -1,0 +1,22 @@
+diff --git a/include/Unreal/Hooks/Internal/DetourSubclasses.hpp b/include/Unreal/Hooks/Internal/DetourSubclasses.hpp
+index 413fde1..a91c366 100644
+--- a/include/Unreal/Hooks/Internal/DetourSubclasses.hpp
++++ b/include/Unreal/Hooks/Internal/DetourSubclasses.hpp
+@@ -42,6 +42,17 @@ namespace RC::Unreal::Hook::Internal
+         {
+             auto Installed = Base::InstallHook();
+             if(!Installed) return false;
++            // UObject::ProcessConsoleExec is a tiny forwarder in a lot of shipping builds
++            // (e.g. sub rsp,38 / mov byte ptr [rsp+20],0 / call impl / add rsp,38 / ret => 19 bytes,
++            // followed by 0xCC padding). PLH's default scheme set is VALLOC2|INPLACE|CODE_CAVE and the
++            // scheme is selected before the prologue size is validated:
++            //   * VALLOC2 succeeds on a normal process, but when the near allocation fails...
++            //   * ...INPLACE is selected, its generated stub needs ~23 bytes of prologue, so hook()
++            //     bails out with "Function too small to hook safely!" and there is no fallback afterwards.
++            // INPLACE_SHORT needs only 12 bytes, which fits such a forwarder, so drop INPLACE from the
++            // chain and let VALLOC2 -> INPLACE_SHORT be the fallback order.
++            PLHDetour->setDetourScheme(static_cast<PLH::x64Detour::detour_scheme_t>(
++                    PLH::x64Detour::VALLOC2 | PLH::x64Detour::INPLACE_SHORT));
+             #ifdef _WIN32
+             static std::atomic_bool bSchemeSet = false;
+             if (auto Module = GetModuleHandle(L"ntdll.dll"); !bSchemeSet.exchange(true, std::memory_order_acq_rel) && Module && GetProcAddress(Module, "wine_get_version"))

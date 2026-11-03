@@ -82,6 +82,31 @@ RE-UE4SS supports the following environment variables:
 
 There are several different ways you can build UE4SS.
 
+### Cloning this fork
+
+The `deps/first/Unreal` submodule (UEPseudo) is pinned to a commit that exists upstream, so the
+standard flow works unchanged - no fork of UEPseudo is needed and no manual patching step:
+
+```bash
+git clone --recursive https://github.com/Tomkrier/RE-UE4SS.git
+cd RE-UE4SS
+git submodule update --init --recursive      # only needed if you cloned without --recursive
+build_ue4ss.bat                              # or the CMake commands below
+```
+
+The fork's changes to the submodule are kept as patch files in [`patches/`](patches) and replayed
+by CMake while the build is configured (`cmake/modules/SubmodulePatches.cmake`):
+
+| Patch | What it does |
+| --- | --- |
+| `UnrealInitializer-peb-walk.patch` | Walks the PEB module list instead of calling `K32EnumProcessModules`, which returns `ERROR_INVALID_HANDLE` when a loader leaves the module list cyclic. |
+| `DetourSubclasses-inplace-short.patch` | Hooks tiny `ProcessConsoleExec` forwarders with `VALLOC2\|INPLACE_SHORT`; the default `INPLACE` scheme needs ~23 bytes of prologue and such forwarders are only 19 bytes. |
+
+Applying is idempotent (`git apply` is skipped when the change is already present), so
+re-configuring or rebuilding is always safe. If you want to change something in the submodule,
+extend the patch files instead of committing inside it - a commit made inside a submodule is not
+fetchable by anyone else and breaks `git clone --recursive` for them.
+
 ## Building from CLI
 
 ### Build Modes
