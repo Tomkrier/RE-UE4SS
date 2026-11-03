@@ -1,13 +1,3 @@
-# Build
-```bash
-git clone https://github.com/Tomkrier/RE-UE4SS.git
-cd RE-UE4SS
-git submodule update --init deps/first/patternsleuth
-git clone https://github.com/Re-UE4SS/UEPseudo.git deps/first/Unreal
-git -C deps/first/Unreal checkout 56bd812
-git -C deps/first/Unreal apply ../../patches/UnrealInitializer-peb-walk.patch
-```
-
 # Unreal Engine 4/5 Scripting System
 
 Lua scripting system platform, C++ Modding API, SDK generator, blueprint mod loader, live property editor and other dumping utilities for UE4/5 games.
